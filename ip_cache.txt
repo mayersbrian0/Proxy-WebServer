@@ -1,1 +1,8 @@
-brightlushquietmorning.neverssl.com 143.204.35.43 
+brightlushquietmorning.neverssl.com 143.204.35.18 
+detectportal.firefox.com 34.107.221.82 
+detectportal.firefox.com 34.107.221.82 
+detectportal.firefox.com 34.107.221.82 
+elra-01.cs.colorado.edu 198.59.7.11 
+edgedl.me.gvt1.com 34.104.35.123 
+netsys.cs.colorado.edu 198.59.7.17 
+ajax.googleapis.com 142.250.69.234 

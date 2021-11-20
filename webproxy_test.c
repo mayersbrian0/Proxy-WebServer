@@ -19,6 +19,19 @@ Web Proxy
 #define MAX_REQ_SIZE 8192
 #define PACKET_SIZE 1024
 
+pthread_mutex_t ip_mutex;
+pthread_mutex_t page_mutex;
+
+
+//create a BST to store the values of hashed url
+
+typedef struct {
+    char* hex_string[33];
+    struct cache_node* left;
+    struct cache_node* right;
+} cache_node;
+
+
 typedef enum {
     BAD_REQUEST,
     NOT_FOUND,
@@ -27,9 +40,8 @@ typedef enum {
 
 //pass mutex and connection fd for threads
 typedef struct {
-    int conn_fd;
-    pthread_mutex_t ip_mutex;
-    pthread_mutex_t cache_mutex;
+    int *conn_fd;
+    cache_node* tree_head;
 } thread_args;
 
 //hold req info
@@ -84,6 +96,14 @@ void parse_req(char * http_req, HTTP_REQUEST *new_request, int connection_fd) {
     char url[MAX_URL_SIZE], new_url[MAX_URL_SIZE];
     int port_num = 80, i = 0, new_port = 0;
 
+    bzero(url, MAX_URL_SIZE);
+    bzero(new_url, MAX_URL_SIZE);
+    bzero(new_request->method, 10);
+    bzero(new_request->full_url, MAX_URL_SIZE);
+    bzero(new_request->msg, MAX_REQ_SIZE);
+    bzero(new_request->hostname, MAX_URL_SIZE);
+    bzero(new_request->path, MAX_URL_SIZE);
+
     if (sscanf(http_req, "%s %s %s", new_request->method, url, new_request->version) != 3)  { handle_error(connection_fd, BAD_REQUEST); return; }
     if (strncmp(new_request->method, "GET", 3) != 0) { handle_error(connection_fd, BAD_REQUEST); return; }
 
@@ -129,7 +149,6 @@ int check_blacklisted(char* ip_addr, char* hostname) {
     fp = fopen("blocked.txt", "r");
     if (fp == NULL) return 1; 
 
-
     //check if it matches the IP or the hostname in the file
     while( (ret = getline(&line, &len, fp)) > 0) {
         if (strncmp(hostname, line, strlen(hostname)) == 0) { blocked=1; break;}
@@ -141,6 +160,7 @@ int check_blacklisted(char* ip_addr, char* hostname) {
     fclose(fp);
     return 0;
 }
+
  
 /*
 Check if hostname is cached
@@ -153,14 +173,19 @@ int check_ip_cache(char* hostname, char* ip) {
 
     FILE* fp = fopen("ip_cache.txt", "a+");
     if (fp == NULL) return 1;
-    fseek(fp, 0, 0); //move to start of file
 
+    pthread_mutex_lock(&ip_mutex); //lock
+
+    fseek(fp, 0, 0); //move to start of file
     //search for ip address in file
     while (ret = getline(&line, &len, fp) > 0) {
         sscanf(line, "%*s %s", ip);
         strtok(line, " ");
         if (strncmp(hostname, line, strlen(hostname)) == 0) {found =1; break;}
     }
+
+    pthread_mutex_unlock(&ip_mutex); //unlock
+
     if (line != NULL) free(line);
     if (found == 1) return 0;
 
@@ -177,12 +202,6 @@ void add_ip_cache(char* hostname, char* ip_addr) {
     fclose(fp);
 }
 
-/*
-Removes the hostname-ip mapping after sigint (Not Implemented yet)
-*/
-void ip_free() {
-
-}
 
 /*
 Send Error Messagesm Choice
@@ -203,6 +222,38 @@ void handle_error(int connection_fd, ERROR e) {
     }
 
     write(connection_fd, error_msg, strlen(error_msg));
+}
+
+/*
+Hashes url path
+*/
+void md5_hash(char* url, char* hash_value) {
+    unsigned char value[16];
+    char hex_value[33];
+
+    MD5_CTX context;
+    MD5_Init(&context);
+    MD5_Update(&context, url, strlen(url));
+    MD5_Final(value, &context);
+
+    //convert to hex 
+    for(int i = 0; i < 16; ++i)
+        sprintf(&hex_value[i*2], "%02x", (unsigned int)value[i]);
+    strcpy(hash_value, hex_value);
+}
+
+/*
+Checks the cache
+0 - not found
+1 - found
+2 - found but expiered
+*/
+int search_bst(cache_node* head) {
+    if (head == NULL) {
+        return 0; //not found
+    }
+
+    return 0;
 }
 
 /*
@@ -232,7 +283,6 @@ int contact_server(char* ip_addr, char* url, char* version, char* hostname, int 
     //pass on http_req to server   
     write(sockfd, request_buffer, strlen(request_buffer));
     
-
     while ( (n = read(sockfd, file_contents, PACKET_SIZE)) > 0) {
         write(connection_fd, file_contents, n);
     }
@@ -243,8 +293,8 @@ int contact_server(char* ip_addr, char* url, char* version, char* hostname, int 
 /*
 Function parses http req from client and then retransmits it to the server
 */
-void get_req(int connection_fd) {
-    char http_req[MAX_REQ_SIZE];
+void get_req(int connection_fd, cache_node* head) {
+    char http_req[MAX_REQ_SIZE], hex_hash[33];
     struct hostent* host;
 
     HTTP_REQUEST *new_req = (HTTP_REQUEST*) malloc(sizeof(HTTP_REQUEST));
@@ -263,6 +313,10 @@ void get_req(int connection_fd) {
     else { ip_addr = inet_ntoa(*((struct in_addr*) host->h_addr_list[0])); add_ip_cache(new_req->hostname, ip_addr);}
     //check if IP/hostname is blacklisted
     if (check_blacklisted(ip_addr, new_req->hostname) == 1) { handle_error(connection_fd, FORBIDDEN); return;}
+
+    md5_hash(new_req->full_url, hex_hash);
+    printf("%s\n", hex_hash);
+
     //send new HTTP message
     if ( contact_server(ip_addr, new_req->path, new_req->version, new_req->hostname, new_req->port, connection_fd, n) == -1) exit(0);
 
@@ -272,11 +326,14 @@ void get_req(int connection_fd) {
 /*
 thread routine
 */
-void *handle_connection(void *thread_args) {
-    int connection_fd = *((int *)thread_args);
-    pthread_detach(pthread_self()); //no need to call pthread_join()
-    free(thread_args); 
-    get_req(connection_fd);
+void *handle_connection(void *thread_values) {
+    thread_args *passed_vals = thread_values;
+    cache_node * head = passed_vals->tree_head;
+    int connection_fd = *((int*)(passed_vals->conn_fd));
+    pthread_detach(pthread_self()); //no need to call pthread_join() 
+    free(passed_vals->conn_fd);
+    free(passed_vals);
+    get_req(connection_fd, head);
     close(connection_fd); //client can now stop waiting
     return NULL;
 }
@@ -303,11 +360,19 @@ int main(int argc, char** argv) {
 
     serverfd = open_serverfd(port);
     if (serverfd < 0) { printf("Error connecting to port %d\n", port); exit(0); }
+
+    pthread_mutex_init(&ip_mutex, NULL);
+
+    cache_node* head = NULL; //pointer to the head of the BST
+
     //server terminates on ctl-c
     while (1) {
         connect_fd = malloc(sizeof(int)); //allocate space for pointer
         *connect_fd = accept(serverfd, (struct sockaddr *)&clientaddr, &clientlen); //start accepting requests
-        pthread_create(&thread_id, NULL, handle_connection, connect_fd); //pass new file descripotr to thread routine
+        thread_args *thread_values = malloc(sizeof(thread_values));
+        thread_values->conn_fd = connect_fd;
+        thread_values->tree_head = head;
+        pthread_create(&thread_id, NULL, handle_connection, thread_values); //pass new file descripotr to thread routine
     }
 
     //TODO: free with sigint handler (NOTE infinte loop)
