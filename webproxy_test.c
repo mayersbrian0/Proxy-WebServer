@@ -22,14 +22,13 @@ Web Proxy
 pthread_mutex_t ip_mutex;
 pthread_mutex_t page_mutex;
 
-
 //create a BST to store the values of hashed url
-
-typedef struct {
-    char* hex_string[33];
+struct cache_node {
+    char hex_string[33];
     struct cache_node* left;
     struct cache_node* right;
-} cache_node;
+    struct timeval* timestamp;
+};
 
 
 typedef enum {
@@ -41,7 +40,8 @@ typedef enum {
 //pass mutex and connection fd for threads
 typedef struct {
     int *conn_fd;
-    cache_node* tree_head;
+    struct cache_node* tree_head;
+    int timeout; //timeout in seconds
 } thread_args;
 
 //hold req info
@@ -60,6 +60,26 @@ typedef struct {
 
 } HTTP_RESPONSE;
 
+/*
+Send Error Messagesm Choice
+*/
+void handle_error(int connection_fd, ERROR e) {
+    char error_msg[500];
+    memset(error_msg, 0, 500);
+    switch (e) {
+        case 0:
+            sprintf(error_msg, "HTTP/1.1 400 Bad Request\n");
+            break;
+        case 1:
+            sprintf(error_msg, "HTTP/1.1 404 Not Found\n");
+            break;
+        case 2:
+            sprintf(error_msg, "HTTP/1.1 403 Forbidden\n");
+            break;
+    }
+
+    write(connection_fd, error_msg, strlen(error_msg));
+}
 
 /*
 Function to bind the server to a port
@@ -161,7 +181,6 @@ int check_blacklisted(char* ip_addr, char* hostname) {
     return 0;
 }
 
- 
 /*
 Check if hostname is cached
 */
@@ -202,28 +221,6 @@ void add_ip_cache(char* hostname, char* ip_addr) {
     fclose(fp);
 }
 
-
-/*
-Send Error Messagesm Choice
-*/
-void handle_error(int connection_fd, ERROR e) {
-    char error_msg[500];
-    memset(error_msg, 0, 500);
-    switch (e) {
-        case 0:
-            sprintf(error_msg, "HTTP/1.1 400 Bad Request\n");
-            break;
-        case 1:
-            sprintf(error_msg, "HTTP/1.1 404 Not Found\n");
-            break;
-        case 2:
-            sprintf(error_msg, "HTTP/1.1 403 Forbidden\n");
-            break;
-    }
-
-    write(connection_fd, error_msg, strlen(error_msg));
-}
-
 /*
 Hashes url path
 */
@@ -248,23 +245,97 @@ Checks the cache
 1 - found
 2 - found but expiered
 */
-int search_bst(cache_node* head) {
+void search_cache(struct cache_node* head, char* hex_hash, int* status) {
     if (head == NULL) {
-        return 0; //not found
+        *status = 0;
+        return; //not found
+    }
+    
+    //Handle Comparisons of hex values
+    int temp1 = -1, temp2 = -1, result = -1;
+    for (int i = 0; i < strlen(hex_hash); i++) {
+        temp1 = (int)hex_hash[i];
+        temp2 = (int)(head->hex_string[i]);
+        if ( (int)hex_hash[i] >= (int)'a' && (int)hex_hash[i] <= (int)'f') temp1 = (int)(hex_hash[i] - 'a' + 10);
+        if ( (int)head->hex_string[i] >= (int)'a' && (int)hex_hash[i] <= (int)'f') temp2 = (int)(head->hex_string[i] - 'a' + 10);
+
+        printf("%d\n", temp1);
+        printf("%d\n", temp2);
+        if (temp1 < temp2) { result = 1; break; }
+        else if (temp1 > temp2) { result=2; break; }
+        else { result = 3; break; }
+    } 
+
+    //value is found
+    if (result == 3) {
+        *status = 1;
+        return;
     }
 
-    return 0;
+    //move right
+    else if (result == 2) {
+        search_cache(head->right, hex_hash, status);
+    }
+
+    //move left
+    else {
+        search_cache(head->left, hex_hash, status);
+    }
+
+    return;
+    
+}
+
+/*
+Adds to the in memory data structure
+*/
+struct cache_node* add_cache(struct cache_node* head, char* hex_hash, struct timeval* time) {
+    if (head == NULL) {
+        struct cache_node* new_node = (struct cache_node*)malloc(sizeof(struct cache_node));
+        bzero(new_node->hex_string, 33);
+        strcpy(new_node->hex_string, hex_hash);
+        new_node->left = NULL;
+        new_node->right = NULL;
+        new_node->timestamp = time;
+        return new_node;
+    }
+
+    //Handle Comparisons of hex values
+    int temp1 = -1, temp2 = -1, result = -1;
+    for (int i = 0; i < strlen(hex_hash); i++) {
+        temp1 = (int)hex_hash[i];
+        temp2 = (int)(head->hex_string[i]);
+        if ( (int)hex_hash[i] >= (int)'a' && (int)hex_hash[i] <= (int)'f') temp1 = (int)(hex_hash[i] - 'a' + 10);
+        if ( (int)head->hex_string[i] >= (int)'a' && (int)head->hex_string[i] <= (int)'f') temp2 = (int)(head->hex_string[i] - 'a' + 10);
+
+        if (temp1 < temp2) { result = 1; break; }
+        else if (temp1 > temp2) { result=2; break; }
+        else { result = 3; break; }
+    } 
+
+    if (result == 1) head->left = add_cache(head->left, hex_hash, time);
+    if (result == 2) head->right = add_cache(head->right, hex_hash, time);
+    if (result == 3) head->timestamp = time; //update the timestamp if found
+
+    return head;
 }
 
 /*
 Sets up a new TCP connection for with the intended server
 */
-int contact_server(char* ip_addr, char* url, char* version, char* hostname, int port_num, int connection_fd, int req_size) {
-    int sockfd, connfd, b_read = 0, b_write = 0;
+int contact_server(char* ip_addr, char* url, char* version, char* hostname, int port_num, int connection_fd, int req_size, struct cache_node* head, char* hex_hash, int status) {
+    int sockfd, connfd, b_read = 0, b_write = 0, n;
     struct sockaddr_in servaddr, cli;
+    struct timeval* timestamp;
     char file_contents[PACKET_SIZE];
     char request_buffer[512]; //build the response
-    int n;
+    char file_path[40];
+    bzero(file_path, 40);
+    strcpy(file_path, "./cache/");
+    strcat(file_path, hex_hash);
+    FILE* new_file;
+
+    new_file = fopen(file_path, "wb+");
 
     //setup TCP connection with server
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) return -1;
@@ -282,20 +353,71 @@ int contact_server(char* ip_addr, char* url, char* version, char* hostname, int 
 
     //pass on http_req to server   
     write(sockfd, request_buffer, strlen(request_buffer));
+
     
     while ( (n = read(sockfd, file_contents, PACKET_SIZE)) > 0) {
         write(connection_fd, file_contents, n);
+        fwrite(file_contents, 1, n, new_file);
     }
 
+    if (status == 0) {
+        //gettimeofday(timestamp, NULL);
+        printf("First time\n");
+        pthread_mutex_lock(&page_mutex);
+        add_cache(head, hex_hash, timestamp);
+        pthread_mutex_unlock(&page_mutex);
+    }
+
+    fclose(new_file);
     close(sockfd); //close connection after read
+    return 0;
+}
+
+/*
+Read from cache
+*/
+void read_file(int connection_fd, char* hex_hash) {
+    FILE* fp;
+    int n;
+    char file_path[40];
+    char file_content[PACKET_SIZE];
+
+    bzero(file_content, PACKET_SIZE);
+    bzero(file_path, 40);
+    strcpy(file_path, "./cache/");
+    strcat(file_path, hex_hash);
+
+    printf("Cache hit\n");
+
+    fp = fopen(file_path, "r");
+    if (fp == NULL) { handle_error(connection_fd, NOT_FOUND); return; }
+
+    pthread_mutex_lock(&page_mutex);
+
+    while ( (n = fread(file_content, 1, PACKET_SIZE, fp)) > 0) {
+        write(connection_fd, file_content, n);
+    }
+
+    pthread_mutex_unlock(&page_mutex);
+
+    fclose(fp);
+    return;
+}
+
+void print_tree(struct cache_node* head) {
+    if (head == NULL) {return;}
+    print_tree(head->left);
+    printf("%s\n", head->hex_string);
+    print_tree(head->right);
 }
 
 /*
 Function parses http req from client and then retransmits it to the server
 */
-void get_req(int connection_fd, cache_node* head) {
+void get_req(int connection_fd, struct cache_node* head) {
     char http_req[MAX_REQ_SIZE], hex_hash[33];
     struct hostent* host;
+    int status = -1; //used to determine if the page is in/out/expiered
 
     HTTP_REQUEST *new_req = (HTTP_REQUEST*) malloc(sizeof(HTTP_REQUEST));
     char* ip_addr = (char *)malloc(sizeof(20));
@@ -315,11 +437,20 @@ void get_req(int connection_fd, cache_node* head) {
     if (check_blacklisted(ip_addr, new_req->hostname) == 1) { handle_error(connection_fd, FORBIDDEN); return;}
 
     md5_hash(new_req->full_url, hex_hash);
-    printf("%s\n", hex_hash);
+    pthread_mutex_lock(&page_mutex);
+    search_cache(head, hex_hash, &status);
+    pthread_mutex_unlock(&page_mutex);
 
-    //send new HTTP message
-    if ( contact_server(ip_addr, new_req->path, new_req->version, new_req->hostname, new_req->port, connection_fd, n) == -1) exit(0);
+    //found in cache 
+    if (status == 1) read_file(connection_fd, hex_hash);
 
+    //send new HTTP message (not found or expiered)
+    else if ( contact_server(ip_addr, new_req->path, new_req->version, new_req->hostname, new_req->port, connection_fd, n, head, hex_hash, status) == 0);
+
+    //error found
+    else exit(0);
+
+    print_tree(head);
     free(new_req);
 }
 
@@ -328,12 +459,11 @@ thread routine
 */
 void *handle_connection(void *thread_values) {
     thread_args *passed_vals = thread_values;
-    cache_node * head = passed_vals->tree_head;
+    struct cache_node * head = passed_vals->tree_head;
     int connection_fd = *((int*)(passed_vals->conn_fd));
     pthread_detach(pthread_self()); //no need to call pthread_join() 
     free(passed_vals->conn_fd);
-    free(passed_vals);
-    get_req(connection_fd, head);
+    get_req(connection_fd, passed_vals->tree_head);
     close(connection_fd); //client can now stop waiting
     return NULL;
 }
@@ -362,8 +492,10 @@ int main(int argc, char** argv) {
     if (serverfd < 0) { printf("Error connecting to port %d\n", port); exit(0); }
 
     pthread_mutex_init(&ip_mutex, NULL);
+    pthread_mutex_init(&page_mutex, NULL);
 
-    cache_node* head = NULL; //pointer to the head of the BST
+    struct cache_node* head = (struct cache_node*)malloc(sizeof(struct cache_node)); //pointer to the head of the BST
+    memset(head->hex_string, 0, 33);
 
     //server terminates on ctl-c
     while (1) {

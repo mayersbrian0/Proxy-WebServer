@@ -6,3 +6,8 @@ elra-01.cs.colorado.edu 198.59.7.11
 edgedl.me.gvt1.com 34.104.35.123 
 netsys.cs.colorado.edu 198.59.7.17 
 ajax.googleapis.com 142.250.69.234 
+btechsmartclass.com 166.62.10.228 
+www.saveyourself.tv 172.67.169.185 
+saveyourself.tv 172.67.169.185 
+s3.amazonaws.com 52.217.64.54 
+192.168.43.20 192.168.43.20 
